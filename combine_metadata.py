@@ -15,6 +15,7 @@ SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', 'heic', '.mp4', '.mov']
 def find_image_json_pairs(directory):
     pairs = []
     missing_metadata = []
+    image_exts = ['.jpg', '.jpeg', '.png', '.heic']
     for file in os.listdir(directory):
         if any(file.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             image_path = os.path.join(directory, file)
@@ -26,7 +27,25 @@ def find_image_json_pairs(directory):
             elif os.path.exists(json_path_2):
                 pairs.append((image_path, json_path_2))
             else:
-                missing_metadata.append(image_path)
+                # If this is a video, try to find metadata for a corresponding image
+                ext = os.path.splitext(file)[1].lower()
+                base = file.split('.', 1)[0]
+                found = False
+                if ext in ['.mp4', '.mov']:
+                    for img_ext in image_exts:
+                        img_file = base + img_ext
+                        img_json_1 = os.path.join(directory, img_file + '.supplemental-metadata.json')
+                        img_json_2 = os.path.join(directory, img_file + '.suppl.json')
+                        if os.path.exists(img_json_1):
+                            pairs.append((image_path, img_json_1))
+                            found = True
+                            break
+                        elif os.path.exists(img_json_2):
+                            pairs.append((image_path, img_json_2))
+                            found = True
+                            break
+                if not found:
+                    missing_metadata.append(image_path)
     return pairs, missing_metadata
 
 def flatten_json(y, prefix=''):
@@ -134,6 +153,10 @@ def embed_metadata_ffmpeg(video_path, metadata):
     logging.info(f"Running ffmpeg to embed metadata: {' '.join(shlex.quote(str(c)) for c in cmd)}")
     subprocess.run(cmd, check=True)
     logging.info(f"Created video with embedded metadata: {output_path}")
+    orig_creation_date = get_finder_creation_date(video_path)
+    if orig_creation_date:
+        set_finder_creation_date(output_path, orig_creation_date)
+        logging.info(f"Set Finder creation date for {os.path.basename(output_path)} to {orig_creation_date}")
 
 def create_csv_manifest(directory):
     files = os.listdir(directory)
@@ -141,6 +164,8 @@ def create_csv_manifest(directory):
     base_to_files = {}
     for f in files:
         base = f.split('.', 1)[0]
+        if base.endswith('_withmeta'):
+            base = base[:-9]  # remove '_withmeta'
         if base not in base_to_files:
             base_to_files[base] = []
         base_to_files[base].append(f)
@@ -212,6 +237,21 @@ def set_finder_creation_date(filepath, date_str):
 # Example usage:
 # set_finder_creation_date('test_photos/IMG_0562.JPG', '03/22/2023 19:47:22')
 
+def get_finder_creation_date(filepath):
+    # Use mdls to get kMDItemFSCreationDate
+    result = subprocess.run(
+        ['mdls', '-raw', '-name', 'kMDItemFSCreationDate', filepath],
+        capture_output=True, text=True
+    )
+    date_str = result.stdout.strip()
+    # Example output: 2023-03-22 19:47:22 +0000
+    # Convert to MM/DD/YYYY HH:MM:SS
+    if date_str:
+        from datetime import datetime
+        dt = datetime.strptime(date_str.split(' +')[0], '%Y-%m-%d %H:%M:%S')
+        return dt.strftime('%m/%d/%Y %H:%M:%S')
+    return None
+
 def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     parser = argparse.ArgumentParser(description='Embed Google Takeout JSON metadata into images.')
@@ -259,6 +299,12 @@ def main():
                 logging.info(f"Updated file system dates for {os.path.basename(image_path)}")
             # For PNGs, set Finder creation date using SetFile and best available date
             if ext == '.png' and best_timestamp:
+                dt = datetime.datetime.fromtimestamp(int(best_timestamp))
+                date_str = dt.strftime('%m/%d/%Y %H:%M:%S')
+                set_finder_creation_date(image_path, date_str)
+                logging.info(f"Set Finder creation date for {os.path.basename(image_path)} to {date_str}")
+            # For MP4s, set Finder creation date using SetFile and best available date
+            if ext == '.mp4' and best_timestamp:
                 dt = datetime.datetime.fromtimestamp(int(best_timestamp))
                 date_str = dt.strftime('%m/%d/%Y %H:%M:%S')
                 set_finder_creation_date(image_path, date_str)
