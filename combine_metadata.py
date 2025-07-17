@@ -8,6 +8,7 @@ import logging
 import subprocess
 import csv
 import shlex
+import datetime
 
 SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', 'heic', '.mp4', '.mov']
 
@@ -136,37 +137,34 @@ def embed_metadata_ffmpeg(video_path, metadata):
 
 def create_csv_manifest(directory):
     files = os.listdir(directory)
-    # Only use original media files (not _withmeta) for base names
-    media_files = [f for f in files if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS and '_withmeta' not in os.path.splitext(f)[0]]
+    # Group all files by base name before the first dot
+    base_to_files = {}
+    for f in files:
+        base = f.split('.', 1)[0]
+        if base not in base_to_files:
+            base_to_files[base] = []
+        base_to_files[base].append(f)
     rows = []
-    for media in media_files:
-        base_name = os.path.splitext(media)[0]
-        ext = os.path.splitext(media)[1].lower()
+    for base, grouped_files in base_to_files.items():
         manifest = {
-            'base_name': base_name,
+            'base_name': base,
             'image': '',
             'video': '',
             'video_withmeta': '',
             'metadata': ''
         }
-        if ext in ['.jpg', '.jpeg', '.png', '.heic']:
-            manifest['image'] = media
-        elif ext in ['.mp4', '.mov']:
-            manifest['video'] = media
-        # Look for metadata file (support both .supplemental-metadata.json and .suppl.json)
-        metadata_candidates = [
-            f"{media}.supplemental-metadata.json",
-            f"{media}.suppl.json"
-        ]
-        for metadata_file in metadata_candidates:
-            if metadata_file in files:
-                manifest['metadata'] = metadata_file
-                break
-        # Look for withmeta.mp4 file (always .mp4)
-        withmeta_file = f"{base_name}_withmeta.mp4"
-        if withmeta_file in files:
-            manifest['video_withmeta'] = withmeta_file
-        rows.append(manifest)
+        for f in grouped_files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in ['.jpg', '.jpeg', '.png', '.heic']:
+                manifest['image'] = f
+            elif ext in ['.mp4', '.mov'] and '_withmeta' not in f:
+                manifest['video'] = f
+            elif ext == '.mp4' and '_withmeta' in f:
+                manifest['video_withmeta'] = f
+            elif f.endswith('.supplemental-metadata.json') or f.endswith('.suppl.json'):
+                manifest['metadata'] = f
+        if any([manifest['image'], manifest['video'], manifest['video_withmeta'], manifest['metadata']]):
+            rows.append(manifest)
     csv_path = os.path.join(directory, 'manifest.csv')
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = ['base_name', 'image', 'video', 'video_withmeta', 'metadata']
@@ -176,14 +174,17 @@ def create_csv_manifest(directory):
             writer.writerow(row)
     logging.info(f"Created CSV manifest: {csv_path}")
 
-def set_creation_date_for_all_images(directory, default_date='2000:01:01 00:00:00'):
+def set_creation_date_for_all_images(directory, default_date=None):
     """
     For each image in the directory, set the file system creation date to EXIF DateTimeOriginal if present,
-    otherwise set to the provided default_date (format: YYYY:MM:DD HH:MM:SS).
+    otherwise set to today's date (format: YYYY:MM:DD HH:MM:SS).
     """
+    if default_date is None:
+        now = datetime.datetime.now()
+        default_date = now.strftime('%Y:%m:%d %H:%M:%S')
     for file in os.listdir(directory):
         ext = os.path.splitext(file)[1].lower()
-        if ext in ['.jpg', '.jpeg', '.png', '.heic']:
+        if ext in ['.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4']:
             image_path = os.path.join(directory, file)
             # Try to set from DateTimeOriginal
             result = subprocess.run([
@@ -203,6 +204,13 @@ def set_creation_date_for_all_images(directory, default_date='2000:01:01 00:00:0
                 logging.info(f"Set default creation date for {file}")
             else:
                 logging.info(f"Set creation date from EXIF for {file}")
+
+def set_finder_creation_date(filepath, date_str):
+    # date_str format: MM/DD/YYYY HH:MM:SS
+    subprocess.run(['SetFile', '-d', date_str, filepath], check=True)
+
+# Example usage:
+# set_finder_creation_date('test_photos/IMG_0562.JPG', '03/22/2023 19:47:22')
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -228,14 +236,13 @@ def main():
     logging.info(f"Found {len(pairs)} image/JSON pairs. Ready to embed metadata.")
     logging.info("Listing all image/JSON pairs:")
     for image_path, json_path in pairs:
-        logging.info(f"Image: {os.path.basename(image_path)} <-> JSON: {os.path.basename(json_path)}")
-    for image_path, json_path in pairs:
         try:
             logging.info(f"Processing {os.path.basename(image_path)} with metadata {os.path.basename(json_path)}")
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
             flat_metadata = flatten_json(metadata)
             ext = os.path.splitext(image_path)[1].lower()
+            best_timestamp = flat_metadata.get('photoTakenTime_timestamp') or flat_metadata.get('creationTime_timestamp')
             if ext in ['.mp4', '.mov']:
                 embed_metadata_ffmpeg(image_path, flat_metadata)
             else:
@@ -250,10 +257,15 @@ def main():
                     image_path
                 ], check=True)
                 logging.info(f"Updated file system dates for {os.path.basename(image_path)}")
+            # For PNGs, set Finder creation date using SetFile and best available date
+            if ext == '.png' and best_timestamp:
+                dt = datetime.datetime.fromtimestamp(int(best_timestamp))
+                date_str = dt.strftime('%m/%d/%Y %H:%M:%S')
+                set_finder_creation_date(image_path, date_str)
+                logging.info(f"Set Finder creation date for {os.path.basename(image_path)} to {date_str}")
         except Exception as e:
             logging.error(f"Failed to embed metadata for {image_path}: {e}")
     create_csv_manifest(directory)
-    set_creation_date_for_all_images(directory)
 
 if __name__ == '__main__':
     main() 
